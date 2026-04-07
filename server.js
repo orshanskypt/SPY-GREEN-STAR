@@ -1,21 +1,21 @@
 // ============================================================
-//  SPY GREEN STAR AUTO TRADER — Render.com Web Service
-//  Rules:
-//  - Time window  : 10:45 AM – 3:00 PM ET
-//  - Entry        : TradingView green star webhook
-//  - Strike       : Round UP to nearest whole dollar
-//  - Delta        : 0.40 – 0.50 (closest if none in range)
-//  - Profit target: +8% on option price
-//  - Time stop    : 30 minutes
-//  - Contracts    : 10 (paper trading)
+// SPY GREEN STAR AUTO TRADER — Render.com Web Service
+// Rules:
+// - Time window : 10:45 AM – 3:00 PM ET
+// - Entry : TradingView green star webhook
+// - Strike : Round UP to nearest whole dollar
+// - Delta : 0.40 – 0.50 (closest if none in range)
+// - Profit target: +8% on option price
+// - Time stop : 30 minutes
+// - Contracts : 10 (paper trading)
 // ============================================================
 //
-//  ENVIRONMENT VARIABLES (set in Render dashboard):
-//    TRADIER_SANDBOX_TOKEN  = your Tradier sandbox token
-//    TRADIER_LIVE_TOKEN     = your Tradier live token (add later)
-//    TRADIER_ACCOUNT_ID     = your Tradier account ID
-//    LIVE_MODE              = false (change to true for real money)
-//    PORT                   = 3000 (Render sets this automatically)
+// ENVIRONMENT VARIABLES (set in Render dashboard):
+// TRADIER_SANDBOX_TOKEN = your Tradier sandbox token
+// TRADIER_LIVE_TOKEN = your Tradier live token (add later)
+// TRADIER_ACCOUNT_ID = your Tradier account ID
+// LIVE_MODE = false (change to true for real money)
+// PORT = 3000 (Render sets this automatically)
 // ============================================================
 
 import express from "express";
@@ -24,31 +24,49 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
+// === COLD-START PREVENTION: LIGHTWEIGHT PING ENDPOINTS ===
+// These must be at the top so they respond even during slow startups
+app.get('/ping', (req, res) => {
+    res.status(200).send('OK');
+});
+
+app.get('/healthz', (req, res) => {
+    res.status(200).send('OK');
+});
+
+app.head('/ping', (req, res) => {
+    res.status(200).end();
+});
+
+app.head('/healthz', (req, res) => {
+    res.status(200).end();
+});
+
 // ─── CONFIGURATION ───────────────────────────────────────────
-const LIVE_MODE     = process.env.LIVE_MODE === "true";
-const CONTRACTS     = 10;       // contracts per signal (paper trading)
-const PROFIT_PCT    = 0.08;     // 8% profit target on option price
-const TIME_STOP_MIN = 30;       // minutes before auto-sell
-const DELTA_MIN     = 0.40;     // minimum delta
-const DELTA_MAX     = 0.50;     // maximum delta
-
-const MARKET_OPEN_HOUR  = 10;  // 10:45 AM ET
-const MARKET_OPEN_MIN   = 45;
-const MARKET_CLOSE_HOUR = 15;  // 3:00 PM ET
-const MARKET_CLOSE_MIN  = 0;
-
+const LIVE_MODE = process.env.LIVE_MODE === "true";
+const CONTRACTS = 10; // contracts per signal (paper trading)
+const PROFIT_PCT = 0.08; // 8% profit target on option price
+const TIME_STOP_MIN = 30; // minutes before auto-sell
+const DELTA_MIN = 0.40; // minimum delta
+const DELTA_MAX = 0.50; // maximum delta
+const MARKET_OPEN_HOUR = 10; // 10:45 AM ET
+const MARKET_OPEN_MIN = 45;
+const MARKET_CLOSE_HOUR = 15; // 3:00 PM ET
+const MARKET_CLOSE_MIN = 0;
 const TRADIER_SANDBOX_BASE = "https://sandbox.tradier.com/v1";
-const TRADIER_LIVE_BASE    = "https://api.tradier.com/v1";
-
-const BASE_URL   = LIVE_MODE ? TRADIER_LIVE_BASE    : TRADIER_SANDBOX_BASE;
-const API_TOKEN  = LIVE_MODE
+const TRADIER_LIVE_BASE = "https://api.tradier.com/v1";
+const BASE_URL = LIVE_MODE ? TRADIER_LIVE_BASE : TRADIER_SANDBOX_BASE;
+const API_TOKEN = LIVE_MODE
   ? process.env.TRADIER_LIVE_TOKEN
   : process.env.TRADIER_SANDBOX_TOKEN;
 const ACCOUNT_ID = process.env.TRADIER_ACCOUNT_ID;
-// ─────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────
 // Track active trade in memory
 let activeTrade = null;
+
+// Early startup log
+console.log(`[${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET] Server starting...`);
 
 // Helper: Tradier API request
 async function tradierRequest(method, path, params = {}) {
@@ -85,8 +103,8 @@ function getETTime() {
 // Helper: is current time within trading window?
 function isInTradingWindow() {
   const { hour, minute } = getETTime();
-  const nowMins   = hour * 60 + minute;
-  const openMins  = MARKET_OPEN_HOUR  * 60 + MARKET_OPEN_MIN;
+  const nowMins = hour * 60 + minute;
+  const openMins = MARKET_OPEN_HOUR * 60 + MARKET_OPEN_MIN;
   const closeMins = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MIN;
   return nowMins >= openMins && nowMins <= closeMins;
 }
@@ -105,21 +123,16 @@ function roundUpStrike(price) {
 }
 
 // Helper: find today's best call option
-// Priority: delta 0.40-0.50 at rounded-up strike
-// Fallback: closest delta to 0.45 if none in range
 async function getBestCallOption(spyPrice) {
   const { dateStr } = getETTime();
-
   const data = await tradierRequest(
     "GET",
     `/markets/options/chains?symbol=SPY&expiration=${dateStr}&greeks=true`
   );
-
   const options = data?.options?.option;
   if (!options || options.length === 0) {
     throw new Error(`No options found for SPY expiration ${dateStr}`);
   }
-
   const calls = options.filter((o) => o.option_type === "call");
   if (calls.length === 0) throw new Error("No call options found for today");
 
@@ -144,7 +157,6 @@ async function getBestCallOption(spyPrice) {
   const withDelta = calls.filter((o) => o.greeks?.delta != null);
 
   if (withDelta.length === 0) {
-    // No Greeks available (common in sandbox) — use rounded-up strike
     console.log("No Greeks available (sandbox) — using rounded-up strike as fallback");
     const fallback = calls.find((o) => o.strike === targetStrike) ||
       calls.reduce((prev, curr) =>
@@ -157,7 +169,6 @@ async function getBestCallOption(spyPrice) {
     Math.abs((curr.greeks?.delta || 0) - 0.45) < Math.abs((prev.greeks?.delta || 0) - 0.45)
       ? curr : prev
   );
-
   console.log(`✓ Fallback: strike $${closest.strike} delta ${closest.greeks?.delta}`);
   return { symbol: closest.symbol, strike: closest.strike, ask: closest.ask, delta: closest.greeks?.delta };
 }
@@ -238,8 +249,15 @@ async function closePositionAtMarket(optionSymbol, profitOrderId) {
 
 // ─── WEBHOOK ENDPOINT ─────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
+  const startTime = Date.now();
   console.log("\n=== WEBHOOK RECEIVED ===");
   console.log(`Mode: ${LIVE_MODE ? "🔴 LIVE" : "🟡 SANDBOX (paper)"}`);
+
+  // Cold start detection
+  const uptimeMs = process.uptime() * 1000;
+  if (uptimeMs < 10000) {  // Less than 10 seconds uptime = likely cold start
+    console.log(`⚠️  Possible cold start detected - Time since container start: ${Math.round(uptimeMs/1000)}s`);
+  }
 
   try {
     // 1. Check trading window
@@ -282,10 +300,13 @@ app.post("/webhook", async (req, res) => {
 
     // 8. Schedule 30-min time stop
     console.log(`⏰ Time stop scheduled in ${TIME_STOP_MIN} minutes`);
+
     setTimeout(async () => {
       console.log("\n=== 30-MIN TIME STOP TRIGGERED ===");
       await closePositionAtMarket(optionSymbol, profitOrderId);
     }, TIME_STOP_MIN * 60 * 1000);
+
+    console.log(`✅ Webhook processed in ${Date.now() - startTime}ms`);
 
     return res.json({
       status: "trade opened",
@@ -302,14 +323,13 @@ app.post("/webhook", async (req, res) => {
       buyOrderId: buyOrder?.id,
       profitOrderId,
     });
-
   } catch (err) {
     console.error("Error:", err.message);
     return res.status(500).json({ status: "error", message: err.message });
   }
 });
 
-// Health check
+// Health check (root route)
 app.get("/", (req, res) => {
   res.json({
     status: "running",
@@ -324,4 +344,5 @@ app.listen(PORT, () => {
   console.log(`Mode: ${LIVE_MODE ? "🔴 LIVE" : "🟡 SANDBOX (paper)"}`);
   console.log(`Window: 10:45 AM – 3:00 PM ET`);
   console.log(`Strike: Round UP | Delta: ${DELTA_MIN}–${DELTA_MAX} | Target: +8% | Stop: 30 min`);
+  console.log(`Ping endpoints available: /ping and /healthz`);
 });
