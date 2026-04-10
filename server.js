@@ -8,6 +8,12 @@
 //  - Exit 1       : 75% of filled contracts at +8% (limit order)
 //  - Exit 2       : 25% runners — +20% target OR 10% trailing stop from peak
 //  - Time stop    : 30 minutes — closes ALL remaining contracts
+//
+//  KILL SWITCH URLS (bookmark on your phone):
+//  GET /pause   — pause bot, skip all signals until resumed
+//  GET /resume  — resume bot
+//  GET /skip    — skip the very next signal only, then auto-resume
+//  GET /status  — check current bot state
 // ============================================================
 
 import express from "express";
@@ -25,21 +31,19 @@ app.head('/healthz', (req, res) => res.status(200).end());
 // ─── CONFIGURATION ───────────────────────────────────────────
 const LIVE_MODE     = process.env.LIVE_MODE === "true";
 const CONTRACTS     = 20;
-const PROFIT_PCT    = 0.08;    // 8% first exit
-const RUNNER_PCT    = 0.20;    // 20% runner target
-const TRAILING_STOP = 0.10;    // 10% trailing stop from peak
+const PROFIT_PCT    = 0.08;
+const RUNNER_PCT    = 0.20;
+const TRAILING_STOP = 0.10;
 const TIME_STOP_MIN = 30;
 const DELTA_MIN     = 0.40;
 const DELTA_MAX     = 0.50;
 const DELTA_TARGET  = 0.45;
 
-// Trade window
 const MARKET_OPEN_HOUR   = 10;
 const MARKET_OPEN_MIN    = 35;
 const MARKET_CLOSE_HOUR  = 15;
 const MARKET_CLOSE_MIN   = 5;
 
-// Delta priority switches on after this hour (1:00 PM ET)
 const DELTA_PRIORITY_HOUR = 13;
 const DELTA_PRIORITY_MIN  = 0;
 
@@ -50,11 +54,51 @@ const API_TOKEN  = LIVE_MODE ? process.env.TRADIER_LIVE_TOKEN : process.env.TRAD
 const ACCOUNT_ID = process.env.TRADIER_ACCOUNT_ID;
 // ─────────────────────────────────────────────────────────────
 
-let activeTrade = null;
+// ─── BOT STATE ────────────────────────────────────────────────
+let activeTrade  = null;
+let botPaused    = false;   // full pause — skips all signals
+let skipNext     = false;   // skip next signal only, then auto-resume
 
 console.log(`[${new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })} ET] Server starting...`);
 
-// Helper: Tradier API request
+// ─── KILL SWITCH ENDPOINTS ────────────────────────────────────
+
+// Pause bot entirely
+app.get('/pause', (req, res) => {
+  botPaused = true;
+  skipNext  = false;
+  console.log('⛔ Bot PAUSED — all signals will be skipped');
+  res.json({ status: 'paused', message: 'Bot paused. All signals will be skipped. Hit /resume to re-enable.' });
+});
+
+// Resume bot
+app.get('/resume', (req, res) => {
+  botPaused = false;
+  skipNext  = false;
+  console.log('✅ Bot RESUMED — signals active');
+  res.json({ status: 'resumed', message: 'Bot resumed. Signals active.' });
+});
+
+// Skip next signal only
+app.get('/skip', (req, res) => {
+  skipNext = true;
+  console.log('⏭️  Skip next signal — will auto-resume after');
+  res.json({ status: 'skip_set', message: 'Next signal will be skipped. Bot auto-resumes after.' });
+});
+
+// Status check
+app.get('/status', (req, res) => {
+  res.json({
+    status: botPaused ? 'PAUSED' : skipNext ? 'SKIP_NEXT' : 'ACTIVE',
+    botPaused,
+    skipNext,
+    activeTrade: activeTrade || 'none',
+    mode: LIVE_MODE ? 'LIVE' : 'SANDBOX',
+  });
+});
+
+// ─── HELPERS ──────────────────────────────────────────────────
+
 async function tradierRequest(method, path, params = {}) {
   const url = `${BASE_URL}${path}`;
   const options = {
@@ -74,7 +118,6 @@ async function tradierRequest(method, path, params = {}) {
   return json;
 }
 
-// Helper: get current ET time
 function getETTime() {
   const now = new Date();
   const etString = now.toLocaleString("en-US", { timeZone: "America/New_York" });
@@ -86,7 +129,6 @@ function getETTime() {
   };
 }
 
-// Helper: is current time within trading window?
 function isInTradingWindow() {
   const { hour, minute } = getETTime();
   const nowMins   = hour * 60 + minute;
@@ -95,15 +137,13 @@ function isInTradingWindow() {
   return nowMins >= openMins && nowMins <= closeMins;
 }
 
-// Helper: is it after 1:00 PM ET (delta priority mode)?
 function isDeltaPriorityMode() {
   const { hour, minute } = getETTime();
-  const nowMins      = hour * 60 + minute;
-  const deltaMins    = DELTA_PRIORITY_HOUR * 60 + DELTA_PRIORITY_MIN;
+  const nowMins   = hour * 60 + minute;
+  const deltaMins = DELTA_PRIORITY_HOUR * 60 + DELTA_PRIORITY_MIN;
   return nowMins >= deltaMins;
 }
 
-// Helper: get live SPY price
 async function getSPYPrice() {
   const data = await tradierRequest("GET", "/markets/quotes?symbols=SPY");
   const quote = data?.quotes?.quote;
@@ -111,7 +151,6 @@ async function getSPYPrice() {
   return parseFloat(quote.last);
 }
 
-// Helper: get live option price
 async function getOptionPrice(optionSymbol) {
   const data = await tradierRequest("GET", `/markets/quotes?symbols=${optionSymbol}`);
   const quote = data?.quotes?.quote;
@@ -119,21 +158,16 @@ async function getOptionPrice(optionSymbol) {
   return parseFloat(quote.last || quote.ask || 0);
 }
 
-// Helper: round UP to nearest whole dollar
 function roundUpStrike(price) {
   return Math.ceil(price);
 }
 
-// Helper: calculate 75/25 split
 function calcSplit(totalFilled) {
   const runners   = Math.floor(totalFilled * 0.25);
   const firstExit = totalFilled - runners;
   return { firstExit, runners };
 }
 
-// Helper: find best call option
-// Before 1 PM : rounded-up strike, confirm delta 0.40–0.50
-// After 1 PM  : closest delta to 0.45 regardless of strike
 async function getBestCallOption(spyPrice) {
   const { dateStr } = getETTime();
   const deltaMode = isDeltaPriorityMode();
@@ -151,12 +185,9 @@ async function getBestCallOption(spyPrice) {
   const calls = options.filter((o) => o.option_type === "call");
   if (calls.length === 0) throw new Error("No call options found for today");
 
-  // ── AFTER 1 PM: DELTA PRIORITY ──────────────────────────────
   if (deltaMode) {
     const withDelta = calls.filter((o) => o.greeks?.delta != null);
-
     if (withDelta.length === 0) {
-      // No Greeks — fall back to rounded-up strike
       console.log("No Greeks available — falling back to rounded-up strike");
       const targetStrike = roundUpStrike(spyPrice);
       const fallback = calls.find((o) => o.strike === targetStrike) ||
@@ -165,18 +196,14 @@ async function getBestCallOption(spyPrice) {
         );
       return { symbol: fallback.symbol, strike: fallback.strike, ask: fallback.ask, delta: "N/A" };
     }
-
-    // Find call with delta closest to 0.45
     const best = withDelta.reduce((prev, curr) =>
       Math.abs((curr.greeks?.delta || 0) - DELTA_TARGET) <
       Math.abs((prev.greeks?.delta || 0) - DELTA_TARGET) ? curr : prev
     );
-
     console.log(`✓ Delta priority: strike $${best.strike} | delta ${best.greeks?.delta} | ask $${best.ask}`);
     return { symbol: best.symbol, strike: best.strike, ask: best.ask, delta: best.greeks?.delta };
   }
 
-  // ── BEFORE 1 PM: STRIKE FIRST, CONFIRM DELTA ────────────────
   const targetStrike = roundUpStrike(spyPrice);
   console.log(`SPY price: $${spyPrice} → Target strike: $${targetStrike}`);
 
@@ -192,7 +219,6 @@ async function getBestCallOption(spyPrice) {
     return { symbol: best.symbol, strike: best.strike, ask: best.ask, delta: best.greeks?.delta };
   }
 
-  // Fallback: closest delta to 0.45 across all strikes
   console.log(`No option at $${targetStrike} in delta range — finding closest delta to 0.45`);
   const withDelta = calls.filter((o) => o.greeks?.delta != null);
 
@@ -213,7 +239,6 @@ async function getBestCallOption(spyPrice) {
   return { symbol: closest.symbol, strike: closest.strike, ask: closest.ask, delta: closest.greeks?.delta };
 }
 
-// Helper: check for existing open SPY position
 async function hasOpenPosition() {
   if (activeTrade) return true;
   const data = await tradierRequest("GET", `/accounts/${ACCOUNT_ID}/positions`);
@@ -223,7 +248,6 @@ async function hasOpenPosition() {
   return posArray.some((p) => p.symbol.startsWith("SPY") && p.quantity > 0);
 }
 
-// Helper: place order
 async function placeOrder(optionSymbol, side, quantity, type, price = null) {
   const params = {
     class: "option",
@@ -239,7 +263,6 @@ async function placeOrder(optionSymbol, side, quantity, type, price = null) {
   return order?.order;
 }
 
-// Helper: cancel order safely
 async function cancelOrder(orderId) {
   try {
     await tradierRequest("DELETE", `/accounts/${ACCOUNT_ID}/orders/${orderId}`);
@@ -249,7 +272,6 @@ async function cancelOrder(orderId) {
   }
 }
 
-// Helper: check if order is filled
 async function isOrderFilled(orderId) {
   try {
     const data = await tradierRequest("GET", `/accounts/${ACCOUNT_ID}/orders/${orderId}`);
@@ -259,7 +281,6 @@ async function isOrderFilled(orderId) {
   }
 }
 
-// Runner monitor — polls every 15 seconds
 async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOrderId, stopTimeMs) {
   console.log(`\n🏃 Runner monitor started: ${runnerQty} contracts`);
   console.log(`   Entry: $${entryPrice} | Target: $${(entryPrice * (1 + RUNNER_PCT)).toFixed(2)} | Trailing stop: 10% from peak`);
@@ -269,7 +290,6 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
 
   const interval = setInterval(async () => {
     try {
-      // Time stop
       if (Date.now() >= stopTimeMs) {
         console.log("⏰ 30-min stop — closing runners at market");
         clearInterval(interval);
@@ -279,7 +299,6 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         return;
       }
 
-      // Check if runner limit already filled
       if (await isOrderFilled(runnerLimitOrderId)) {
         console.log(`✅ Runner target hit at $${targetPrice}`);
         clearInterval(interval);
@@ -287,17 +306,14 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         return;
       }
 
-      // Get current price
       const currentPrice = await getOptionPrice(optionSymbol);
       if (!currentPrice || currentPrice <= 0) return;
 
-      // Update peak
       if (currentPrice > peakPrice) {
         peakPrice = currentPrice;
         console.log(`📈 New peak: $${peakPrice.toFixed(2)}`);
       }
 
-      // Trailing stop
       const trailingStopPrice = parseFloat((peakPrice * (1 - TRAILING_STOP)).toFixed(2));
       if (currentPrice <= trailingStopPrice) {
         console.log(`🛑 Trailing stop hit — current $${currentPrice} <= stop $${trailingStopPrice} (peak $${peakPrice})`);
@@ -328,7 +344,19 @@ app.post("/webhook", async (req, res) => {
   }
 
   try {
-    // 1. Check trading window
+    // 1. Check kill switches
+    if (botPaused) {
+      console.log("⛔ Bot is PAUSED — skipping signal");
+      return res.json({ status: "skipped", reason: "Bot paused" });
+    }
+
+    if (skipNext) {
+      skipNext = false;  // auto-reset after one skip
+      console.log("⏭️  Skipping this signal (skip-next was set) — bot now resumed");
+      return res.json({ status: "skipped", reason: "Skip next was set — bot now resumed" });
+    }
+
+    // 2. Check trading window
     if (!isInTradingWindow()) {
       const { hour, minute } = getETTime();
       console.log(`Outside window at ${hour}:${String(minute).padStart(2, "0")} ET. Skipping.`);
@@ -336,47 +364,47 @@ app.post("/webhook", async (req, res) => {
     }
     console.log("✓ Within trading window (10:35 AM – 3:05 PM ET)");
 
-    // 2. Check for existing position
+    // 3. Check for existing position
     if (await hasOpenPosition()) {
       console.log("Already in a trade. Skipping.");
       return res.json({ status: "skipped", reason: "Already in trade" });
     }
     console.log("✓ No existing position");
 
-    // 3. Get SPY price
+    // 4. Get SPY price
     const spyPrice = await getSPYPrice();
     console.log(`✓ SPY price: $${spyPrice}`);
 
-    // 4. Find best call option
+    // 5. Find best call option
     const { symbol: optionSymbol, strike, ask, delta } = await getBestCallOption(spyPrice);
     console.log(`✓ Selected: ${optionSymbol} | Strike: $${strike} | Ask: $${ask} | Delta: ${delta}`);
 
-    // 5. Place buy order
+    // 6. Place buy order
     const buyOrder  = await placeOrder(optionSymbol, "buy_to_open", CONTRACTS, "market");
     const filledQty = buyOrder?.quantity || CONTRACTS;
     console.log(`✓ Buy order: ID ${buyOrder?.id} | Qty: ${filledQty}`);
 
     const entryPrice = ask || 1.00;
 
-    // 6. Calculate 75/25 split
+    // 7. Calculate 75/25 split
     const { firstExit, runners } = calcSplit(filledQty);
     console.log(`✓ Split: ${firstExit} @ +8% | ${runners} runners`);
 
-    // 7. First exit limit order (75% at +8%)
+    // 8. First exit limit order
     const firstExitPrice = parseFloat((entryPrice * (1 + PROFIT_PCT)).toFixed(2));
     const firstExitOrder = await placeOrder(optionSymbol, "sell_to_close", firstExit, "limit", firstExitPrice);
     console.log(`✓ First exit: ${firstExit} contracts @ $${firstExitPrice} | ID ${firstExitOrder?.id}`);
 
-    // 8. Runner limit order (25% at +20%)
+    // 9. Runner limit order
     const runnerTargetPrice = parseFloat((entryPrice * (1 + RUNNER_PCT)).toFixed(2));
     const runnerLimitOrder  = await placeOrder(optionSymbol, "sell_to_close", runners, "limit", runnerTargetPrice);
     console.log(`✓ Runner limit: ${runners} contracts @ $${runnerTargetPrice} | ID ${runnerLimitOrder?.id}`);
 
-    // 9. Store active trade
+    // 10. Store active trade
     const stopTimeMs = Date.now() + TIME_STOP_MIN * 60 * 1000;
     activeTrade = { optionSymbol, entryPrice, filledQty, firstExit, runners, openedAt: Date.now() };
 
-    // 10. 30-min hard stop for first exit contracts
+    // 11. 30-min hard stop for first exit contracts
     setTimeout(async () => {
       console.log("\n=== 30-MIN TIME STOP — FIRST EXIT CONTRACTS ===");
       const firstFilled = await isOrderFilled(firstExitOrder?.id);
@@ -390,7 +418,7 @@ app.post("/webhook", async (req, res) => {
       activeTrade = null;
     }, TIME_STOP_MIN * 60 * 1000);
 
-    // 11. Runner monitor
+    // 12. Runner monitor
     if (runners > 0) {
       monitorRunners(optionSymbol, runners, entryPrice, runnerLimitOrder?.id, stopTimeMs);
     }
@@ -427,7 +455,7 @@ app.post("/webhook", async (req, res) => {
 // Health check
 app.get("/", (req, res) => {
   res.json({
-    status: "running",
+    status: botPaused ? "PAUSED" : skipNext ? "SKIP_NEXT" : "running",
     mode: LIVE_MODE ? "LIVE" : "SANDBOX",
     activeTrade: activeTrade || "none",
   });
@@ -441,5 +469,5 @@ app.listen(PORT, () => {
   console.log(`Before 1 PM: Strike first | After 1 PM: Delta priority`);
   console.log(`Contracts: ${CONTRACTS} | Split: 75% @ +8% / 25% runners @ +20% or 10% trailing`);
   console.log(`Time stop: ${TIME_STOP_MIN} min hard close all contracts`);
-  console.log(`Ping endpoints: /ping and /healthz`);
+  console.log(`Kill switches: /pause /resume /skip /status`);
 });
