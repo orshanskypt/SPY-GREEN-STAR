@@ -1,10 +1,9 @@
 // ============================================================
 //  SPY GREEN STAR AUTO TRADER — Render.com Web Service
 //  Rules:
-//  - Time window  : 10:45 AM – 3:00 PM ET
-//  - Entry        : TradingView green star webhook
-//  - Strike       : Round UP to nearest whole dollar
-//  - Delta        : 0.40 – 0.50 (closest if none in range)
+//  - Time window  : 10:35 AM – 3:05 PM ET
+//  - Before 1 PM  : Rounded-up strike, confirm delta 0.40–0.50
+//  - After 1 PM   : Delta priority — closest to 0.45 regardless of strike
 //  - Contracts    : 20 (paper trading)
 //  - Exit 1       : 75% of filled contracts at +8% (limit order)
 //  - Exit 2       : 25% runners — +20% target OR 10% trailing stop from peak
@@ -18,25 +17,31 @@ const app = express();
 app.use(express.json());
 
 // === COLD-START PREVENTION ===
-app.get('/ping',    (req, res) => res.status(200).send('OK'));
-app.get('/healthz', (req, res) => res.status(200).send('OK'));
+app.get('/ping',     (req, res) => res.status(200).send('OK'));
+app.get('/healthz',  (req, res) => res.status(200).send('OK'));
 app.head('/ping',    (req, res) => res.status(200).end());
 app.head('/healthz', (req, res) => res.status(200).end());
 
 // ─── CONFIGURATION ───────────────────────────────────────────
-const LIVE_MODE       = process.env.LIVE_MODE === "true";
-const CONTRACTS       = 20;      // total contracts to buy
-const PROFIT_PCT      = 0.08;    // 8% first exit target
-const RUNNER_PCT      = 0.20;    // 20% runner take profit from entry
-const TRAILING_STOP   = 0.10;    // 10% trailing stop from peak on runners
-const TIME_STOP_MIN   = 30;      // hard close all at 30 min
-const DELTA_MIN       = 0.40;
-const DELTA_MAX       = 0.50;
+const LIVE_MODE     = process.env.LIVE_MODE === "true";
+const CONTRACTS     = 20;
+const PROFIT_PCT    = 0.08;    // 8% first exit
+const RUNNER_PCT    = 0.20;    // 20% runner target
+const TRAILING_STOP = 0.10;    // 10% trailing stop from peak
+const TIME_STOP_MIN = 30;
+const DELTA_MIN     = 0.40;
+const DELTA_MAX     = 0.50;
+const DELTA_TARGET  = 0.45;
 
-const MARKET_OPEN_HOUR  = 10;
-const MARKET_OPEN_MIN   = 45;
-const MARKET_CLOSE_HOUR = 15;
-const MARKET_CLOSE_MIN  = 0;
+// Trade window
+const MARKET_OPEN_HOUR   = 10;
+const MARKET_OPEN_MIN    = 35;
+const MARKET_CLOSE_HOUR  = 15;
+const MARKET_CLOSE_MIN   = 5;
+
+// Delta priority switches on after this hour (1:00 PM ET)
+const DELTA_PRIORITY_HOUR = 13;
+const DELTA_PRIORITY_MIN  = 0;
 
 const TRADIER_SANDBOX_BASE = "https://sandbox.tradier.com/v1";
 const TRADIER_LIVE_BASE    = "https://api.tradier.com/v1";
@@ -90,6 +95,14 @@ function isInTradingWindow() {
   return nowMins >= openMins && nowMins <= closeMins;
 }
 
+// Helper: is it after 1:00 PM ET (delta priority mode)?
+function isDeltaPriorityMode() {
+  const { hour, minute } = getETTime();
+  const nowMins      = hour * 60 + minute;
+  const deltaMins    = DELTA_PRIORITY_HOUR * 60 + DELTA_PRIORITY_MIN;
+  return nowMins >= deltaMins;
+}
+
 // Helper: get live SPY price
 async function getSPYPrice() {
   const data = await tradierRequest("GET", "/markets/quotes?symbols=SPY");
@@ -111,26 +124,59 @@ function roundUpStrike(price) {
   return Math.ceil(price);
 }
 
-// Helper: calculate 75/25 split — runners always round DOWN, first exit gets remainder
+// Helper: calculate 75/25 split
 function calcSplit(totalFilled) {
-  const runners  = Math.floor(totalFilled * 0.25);
+  const runners   = Math.floor(totalFilled * 0.25);
   const firstExit = totalFilled - runners;
   return { firstExit, runners };
 }
 
-// Helper: find today's best call option
+// Helper: find best call option
+// Before 1 PM : rounded-up strike, confirm delta 0.40–0.50
+// After 1 PM  : closest delta to 0.45 regardless of strike
 async function getBestCallOption(spyPrice) {
   const { dateStr } = getETTime();
+  const deltaMode = isDeltaPriorityMode();
+
+  console.log(`Strike mode: ${deltaMode ? "🎯 DELTA PRIORITY (after 1 PM)" : "📐 STRIKE FIRST (before 1 PM)"}`);
+
   const data = await tradierRequest(
     "GET",
     `/markets/options/chains?symbol=SPY&expiration=${dateStr}&greeks=true`
   );
+
   const options = data?.options?.option;
   if (!options || options.length === 0) throw new Error(`No options found for SPY expiration ${dateStr}`);
 
   const calls = options.filter((o) => o.option_type === "call");
   if (calls.length === 0) throw new Error("No call options found for today");
 
+  // ── AFTER 1 PM: DELTA PRIORITY ──────────────────────────────
+  if (deltaMode) {
+    const withDelta = calls.filter((o) => o.greeks?.delta != null);
+
+    if (withDelta.length === 0) {
+      // No Greeks — fall back to rounded-up strike
+      console.log("No Greeks available — falling back to rounded-up strike");
+      const targetStrike = roundUpStrike(spyPrice);
+      const fallback = calls.find((o) => o.strike === targetStrike) ||
+        calls.reduce((prev, curr) =>
+          Math.abs(curr.strike - spyPrice) < Math.abs(prev.strike - spyPrice) ? curr : prev
+        );
+      return { symbol: fallback.symbol, strike: fallback.strike, ask: fallback.ask, delta: "N/A" };
+    }
+
+    // Find call with delta closest to 0.45
+    const best = withDelta.reduce((prev, curr) =>
+      Math.abs((curr.greeks?.delta || 0) - DELTA_TARGET) <
+      Math.abs((prev.greeks?.delta || 0) - DELTA_TARGET) ? curr : prev
+    );
+
+    console.log(`✓ Delta priority: strike $${best.strike} | delta ${best.greeks?.delta} | ask $${best.ask}`);
+    return { symbol: best.symbol, strike: best.strike, ask: best.ask, delta: best.greeks?.delta };
+  }
+
+  // ── BEFORE 1 PM: STRIKE FIRST, CONFIRM DELTA ────────────────
   const targetStrike = roundUpStrike(spyPrice);
   console.log(`SPY price: $${spyPrice} → Target strike: $${targetStrike}`);
 
@@ -142,15 +188,16 @@ async function getBestCallOption(spyPrice) {
 
   if (inDeltaRange.length > 0) {
     const best = inDeltaRange[0];
-    console.log(`✓ Found at target strike $${targetStrike} delta ${best.greeks?.delta}`);
+    console.log(`✓ Strike first: $${targetStrike} | delta ${best.greeks?.delta} | ask $${best.ask}`);
     return { symbol: best.symbol, strike: best.strike, ask: best.ask, delta: best.greeks?.delta };
   }
 
-  console.log(`No option at $${targetStrike} in delta range. Finding closest delta to 0.45...`);
+  // Fallback: closest delta to 0.45 across all strikes
+  console.log(`No option at $${targetStrike} in delta range — finding closest delta to 0.45`);
   const withDelta = calls.filter((o) => o.greeks?.delta != null);
 
   if (withDelta.length === 0) {
-    console.log("No Greeks available (sandbox) — using rounded-up strike as fallback");
+    console.log("No Greeks available (sandbox) — using rounded-up strike");
     const fallback = calls.find((o) => o.strike === targetStrike) ||
       calls.reduce((prev, curr) =>
         Math.abs(curr.strike - targetStrike) < Math.abs(prev.strike - targetStrike) ? curr : prev
@@ -159,9 +206,10 @@ async function getBestCallOption(spyPrice) {
   }
 
   const closest = withDelta.reduce((prev, curr) =>
-    Math.abs((curr.greeks?.delta || 0) - 0.45) < Math.abs((prev.greeks?.delta || 0) - 0.45) ? curr : prev
+    Math.abs((curr.greeks?.delta || 0) - DELTA_TARGET) <
+    Math.abs((prev.greeks?.delta || 0) - DELTA_TARGET) ? curr : prev
   );
-  console.log(`✓ Fallback: strike $${closest.strike} delta ${closest.greeks?.delta}`);
+  console.log(`✓ Fallback delta: strike $${closest.strike} | delta ${closest.greeks?.delta}`);
   return { symbol: closest.symbol, strike: closest.strike, ask: closest.ask, delta: closest.greeks?.delta };
 }
 
@@ -191,7 +239,7 @@ async function placeOrder(optionSymbol, side, quantity, type, price = null) {
   return order?.order;
 }
 
-// Helper: cancel an order safely
+// Helper: cancel order safely
 async function cancelOrder(orderId) {
   try {
     await tradierRequest("DELETE", `/accounts/${ACCOUNT_ID}/orders/${orderId}`);
@@ -211,19 +259,19 @@ async function isOrderFilled(orderId) {
   }
 }
 
-// Runner monitor — polls every 15 seconds for trailing stop and target
+// Runner monitor — polls every 15 seconds
 async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOrderId, stopTimeMs) {
   console.log(`\n🏃 Runner monitor started: ${runnerQty} contracts`);
   console.log(`   Entry: $${entryPrice} | Target: $${(entryPrice * (1 + RUNNER_PCT)).toFixed(2)} | Trailing stop: 10% from peak`);
 
-  let peakPrice  = entryPrice;
+  let peakPrice     = entryPrice;
   const targetPrice = parseFloat((entryPrice * (1 + RUNNER_PCT)).toFixed(2));
 
   const interval = setInterval(async () => {
     try {
-      // Time stop check
+      // Time stop
       if (Date.now() >= stopTimeMs) {
-        console.log("⏰ 30-min stop reached — closing runners at market");
+        console.log("⏰ 30-min stop — closing runners at market");
         clearInterval(interval);
         await cancelOrder(runnerLimitOrderId);
         await placeOrder(optionSymbol, "sell_to_close", runnerQty, "market");
@@ -231,7 +279,7 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         return;
       }
 
-      // Check if runner limit order already filled
+      // Check if runner limit already filled
       if (await isOrderFilled(runnerLimitOrderId)) {
         console.log(`✅ Runner target hit at $${targetPrice}`);
         clearInterval(interval);
@@ -239,7 +287,7 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         return;
       }
 
-      // Get current option price
+      // Get current price
       const currentPrice = await getOptionPrice(optionSymbol);
       if (!currentPrice || currentPrice <= 0) return;
 
@@ -249,8 +297,7 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         console.log(`📈 New peak: $${peakPrice.toFixed(2)}`);
       }
 
-      // Trailing stop check — only activate after 8% first exit was hit
-      // (runners are only alive after first exit, so entry price is already profitable)
+      // Trailing stop
       const trailingStopPrice = parseFloat((peakPrice * (1 - TRAILING_STOP)).toFixed(2));
       if (currentPrice <= trailingStopPrice) {
         console.log(`🛑 Trailing stop hit — current $${currentPrice} <= stop $${trailingStopPrice} (peak $${peakPrice})`);
@@ -261,12 +308,12 @@ async function monitorRunners(optionSymbol, runnerQty, entryPrice, runnerLimitOr
         return;
       }
 
-      console.log(`👀 Runners: current $${currentPrice.toFixed(2)} | peak $${peakPrice.toFixed(2)} | stop $${trailingStopPrice.toFixed(2)} | target $${targetPrice}`);
+      console.log(`👀 Runners: $${currentPrice.toFixed(2)} | peak $${peakPrice.toFixed(2)} | stop $${trailingStopPrice.toFixed(2)} | target $${targetPrice}`);
 
     } catch (e) {
       console.log("Runner monitor error:", e.message);
     }
-  }, 15000); // check every 15 seconds
+  }, 15000);
 }
 
 // ─── WEBHOOK ENDPOINT ─────────────────────────────────────────
@@ -287,7 +334,7 @@ app.post("/webhook", async (req, res) => {
       console.log(`Outside window at ${hour}:${String(minute).padStart(2, "0")} ET. Skipping.`);
       return res.json({ status: "skipped", reason: "Outside trading window" });
     }
-    console.log("✓ Within trading window (10:45 AM – 3:00 PM ET)");
+    console.log("✓ Within trading window (10:35 AM – 3:05 PM ET)");
 
     // 2. Check for existing position
     if (await hasOpenPosition()) {
@@ -304,32 +351,32 @@ app.post("/webhook", async (req, res) => {
     const { symbol: optionSymbol, strike, ask, delta } = await getBestCallOption(spyPrice);
     console.log(`✓ Selected: ${optionSymbol} | Strike: $${strike} | Ask: $${ask} | Delta: ${delta}`);
 
-    // 5. Place buy order (20 contracts)
-    const buyOrder = await placeOrder(optionSymbol, "buy_to_open", CONTRACTS, "market");
-    const filledQty = buyOrder?.quantity || CONTRACTS; // use actual filled qty
-    console.log(`✓ Buy order placed: ID ${buyOrder?.id} | Qty: ${filledQty}`);
+    // 5. Place buy order
+    const buyOrder  = await placeOrder(optionSymbol, "buy_to_open", CONTRACTS, "market");
+    const filledQty = buyOrder?.quantity || CONTRACTS;
+    console.log(`✓ Buy order: ID ${buyOrder?.id} | Qty: ${filledQty}`);
 
     const entryPrice = ask || 1.00;
 
-    // 6. Calculate 75/25 split based on filled quantity
+    // 6. Calculate 75/25 split
     const { firstExit, runners } = calcSplit(filledQty);
-    console.log(`✓ Split: ${firstExit} contracts at 8% target | ${runners} runners`);
+    console.log(`✓ Split: ${firstExit} @ +8% | ${runners} runners`);
 
-    // 7. Place first exit limit order (75% at +8%)
+    // 7. First exit limit order (75% at +8%)
     const firstExitPrice = parseFloat((entryPrice * (1 + PROFIT_PCT)).toFixed(2));
     const firstExitOrder = await placeOrder(optionSymbol, "sell_to_close", firstExit, "limit", firstExitPrice);
-    console.log(`✓ First exit order: ${firstExit} contracts at $${firstExitPrice} | ID ${firstExitOrder?.id}`);
+    console.log(`✓ First exit: ${firstExit} contracts @ $${firstExitPrice} | ID ${firstExitOrder?.id}`);
 
-    // 8. Place runner limit order (25% at +20%)
+    // 8. Runner limit order (25% at +20%)
     const runnerTargetPrice = parseFloat((entryPrice * (1 + RUNNER_PCT)).toFixed(2));
     const runnerLimitOrder  = await placeOrder(optionSymbol, "sell_to_close", runners, "limit", runnerTargetPrice);
-    console.log(`✓ Runner limit order: ${runners} contracts at $${runnerTargetPrice} | ID ${runnerLimitOrder?.id}`);
+    console.log(`✓ Runner limit: ${runners} contracts @ $${runnerTargetPrice} | ID ${runnerLimitOrder?.id}`);
 
     // 9. Store active trade
     const stopTimeMs = Date.now() + TIME_STOP_MIN * 60 * 1000;
     activeTrade = { optionSymbol, entryPrice, filledQty, firstExit, runners, openedAt: Date.now() };
 
-    // 10. Schedule 30-min hard stop for first exit contracts
+    // 10. 30-min hard stop for first exit contracts
     setTimeout(async () => {
       console.log("\n=== 30-MIN TIME STOP — FIRST EXIT CONTRACTS ===");
       const firstFilled = await isOrderFilled(firstExitOrder?.id);
@@ -343,7 +390,7 @@ app.post("/webhook", async (req, res) => {
       activeTrade = null;
     }, TIME_STOP_MIN * 60 * 1000);
 
-    // 11. Start runner monitor (trailing stop + target + time stop)
+    // 11. Runner monitor
     if (runners > 0) {
       monitorRunners(optionSymbol, runners, entryPrice, runnerLimitOrder?.id, stopTimeMs);
     }
@@ -353,6 +400,7 @@ app.post("/webhook", async (req, res) => {
     return res.json({
       status: "trade opened",
       mode: LIVE_MODE ? "LIVE" : "SANDBOX",
+      strikeMode: isDeltaPriorityMode() ? "delta priority" : "strike first",
       spyPrice,
       optionSymbol,
       strike,
@@ -389,8 +437,9 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`SPY Green Star bot running on port ${PORT}`);
   console.log(`Mode: ${LIVE_MODE ? "🔴 LIVE" : "🟡 SANDBOX (paper)"}`);
-  console.log(`Window: 10:45 AM – 3:00 PM ET`);
-  console.log(`Contracts: ${CONTRACTS} | Split: 75% at +8% / 25% runners at +20% or 10% trailing stop`);
-  console.log(`Time stop: ${TIME_STOP_MIN} min hard close on all contracts`);
+  console.log(`Window: 10:35 AM – 3:05 PM ET`);
+  console.log(`Before 1 PM: Strike first | After 1 PM: Delta priority`);
+  console.log(`Contracts: ${CONTRACTS} | Split: 75% @ +8% / 25% runners @ +20% or 10% trailing`);
+  console.log(`Time stop: ${TIME_STOP_MIN} min hard close all contracts`);
   console.log(`Ping endpoints: /ping and /healthz`);
 });
