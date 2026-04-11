@@ -4,7 +4,7 @@
 //  - Time window  : 10:35 AM – 3:05 PM ET
 //  - Strike       : Round UP to nearest whole dollar (true ATM)
 //  - No delta filtering
-//  - Contracts    : 20 (paper trading)
+//  - Contracts    : 100 (paper trading)
 //  - Exit 1       : 75% of filled contracts at +8% (limit order)
 //  - Exit 2       : 25% runners — +20% target OR 10% trailing stop from peak
 //                   Trailing stop ONLY activates after first exit fills at +8%
@@ -32,7 +32,7 @@ app.head('/healthz', (req, res) => res.status(200).end());
 
 // ─── CONFIGURATION ───────────────────────────────────────────
 const LIVE_MODE     = process.env.LIVE_MODE === "true";
-const CONTRACTS     = 20;
+const CONTRACTS     = 100;
 const PROFIT_PCT    = 0.08;
 const RUNNER_PCT    = 0.20;
 const TRAILING_STOP = 0.10;
