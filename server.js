@@ -39,9 +39,9 @@ const TRAILING_STOP = 0.10;
 const TIME_STOP_MIN = 30;
 
 const MARKET_OPEN_HOUR  = 10;
-const MARKET_OPEN_MIN   = 35;
+const MARKET_OPEN_MIN   = 45;
 const MARKET_CLOSE_HOUR = 15;
-const MARKET_CLOSE_MIN  = 5;
+const MARKET_CLOSE_MIN  = 0;
 
 const TRADIER_SANDBOX_BASE = "https://sandbox.tradier.com/v1";
 const TRADIER_LIVE_BASE    = "https://api.tradier.com/v1";
