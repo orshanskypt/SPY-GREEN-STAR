@@ -11,9 +11,9 @@ app.get('/healthz', (req, res) => res.send('OK'));
 // ─── CONFIG ─────────────────────────────────────
 const LIVE_MODE = process.env.LIVE_MODE === "true";
 const CONTRACTS = 2;
-const PROFIT_PCT = 0.08;           // ✅ single source of truth for profit target
+const PROFIT_PCT = 0.08;
 const TIME_STOP_MIN = 30;
-const SELL_POLL_INTERVAL_MS = 10000; // check sell fill every 10s
+const SELL_POLL_INTERVAL_MS = 10000;
 
 const BASE_URL = LIVE_MODE
   ? "https://api.tradier.com/v1"
@@ -73,7 +73,9 @@ function isInTradingWindow() {
 
 // ─── MARKET FUNCTIONS ───────────────────────────
 async function getTodayExpiration() {
+  console.log("📅 Fetching expirations...");
   const data = await tradierRequest("GET", "/markets/options/expirations?symbol=SPY");
+  console.log("📅 Expiration response:", JSON.stringify(data).slice(0, 200));
   const list = data?.expirations?.date || [];
   const today = getETTime().dateStr;
   if (!list.includes(today)) {
@@ -83,13 +85,16 @@ async function getTodayExpiration() {
 }
 
 async function getSPYPrice() {
+  console.log("💰 Fetching SPY price...");
   const data = await tradierRequest("GET", "/markets/quotes?symbols=SPY");
+  console.log("💰 Quote response:", JSON.stringify(data).slice(0, 200));
   return parseFloat(data.quotes.quote.last);
 }
 
 async function getATMCall(spyPrice) {
   const expiration = await getTodayExpiration();
   const strike = Math.ceil(spyPrice);
+  console.log(`📊 Getting options chain — strike target: ${strike}, expiration: ${expiration}`);
   const data = await tradierRequest(
     "GET",
     `/markets/options/chains?symbol=SPY&expiration=${expiration}`
@@ -98,11 +103,17 @@ async function getATMCall(spyPrice) {
   if (!options.length) throw new Error("No options returned");
   const calls = options.filter(o => o.option_type === "call");
   const exact = calls.find(o => o.strike === strike);
-  if (exact) return exact;
+  if (exact) {
+    console.log(`📊 Exact strike found: ${exact.symbol}`);
+    return exact;
+  }
   const above = calls
     .filter(o => o.strike > spyPrice)
     .sort((a, b) => a.strike - b.strike);
-  if (above.length) return above[0];
+  if (above.length) {
+    console.log(`📊 Using next strike above: ${above[0].symbol}`);
+    return above[0];
+  }
   throw new Error("No ATM call found");
 }
 
@@ -117,11 +128,12 @@ async function placeOrder(symbol, side, qty, type, price = null) {
     duration: "day",
   };
   if (price) params.price = price;
+  console.log(`📤 Placing order:`, JSON.stringify(params));
   const res = await tradierRequest("POST", `/accounts/${ACCOUNT_ID}/orders`, params);
+  console.log(`📥 Order response:`, JSON.stringify(res).slice(0, 200));
   return res.order;
 }
 
-// ✅ FIX: cancel an open order before replacing it
 async function cancelOrder(orderId) {
   try {
     await tradierRequest("DELETE", `/accounts/${ACCOUNT_ID}/orders/${orderId}`);
@@ -150,10 +162,8 @@ async function getFillPrice(orderId) {
   return null;
 }
 
-// ✅ FIX: poll for sell fill so activeTrade clears when profit target hits
 function startSellWatcher(trade) {
   const interval = setInterval(async () => {
-    // Trade was already closed by time stop — stop watching
     if (!activeTrade || activeTrade.sellId !== trade.sellId) {
       clearInterval(interval);
       return;
@@ -182,30 +192,36 @@ function startSellWatcher(trade) {
 
 // ─── WEBHOOK ────────────────────────────────────
 app.post("/webhook", async (req, res) => {
-  console.log("=== WEBHOOK ===");
+  console.log("=== WEBHOOK RECEIVED ===");
   if (botPaused) return res.json({ skip: "paused" });
   if (skipNext) { skipNext = false; return res.json({ skip: "skipNext" }); }
   if (!earlyBird && !isInTradingWindow()) return res.json({ skip: "time" });
   if (activeTrade) return res.json({ skip: "active trade" });
 
+  // earlyBird is one-shot — reset after passing the gate
+  if (earlyBird) {
+    earlyBird = false;
+    console.log("🐦 earlyBird used — resetting to false");
+  }
+
   try {
     const spy = await getSPYPrice();
-    console.log("SPY:", spy);
+    console.log("SPY price:", spy);
 
     const option = await getATMCall(spy);
-    console.log("Option:", option.symbol);
+    console.log("Option selected:", option.symbol);
 
     const buy = await placeOrder(option.symbol, "buy_to_open", CONTRACTS, "market");
     const fill = await getFillPrice(buy.id);
+    console.log("Buy fill price:", fill);
 
-    // ✅ FIX: safe entry price — warn loudly if we can't determine it
     const entry = fill ?? option.ask;
     if (!entry || entry <= 0) {
       throw new Error(`Cannot determine valid entry price (fill=${fill}, ask=${option.ask})`);
     }
 
-    // ✅ FIX: use PROFIT_PCT constant
     const target = +(entry * (1 + PROFIT_PCT)).toFixed(2);
+    console.log(`🎯 Entry: ${entry} → Target: ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
 
     const sell = await placeOrder(
       option.symbol,
@@ -215,12 +231,11 @@ app.post("/webhook", async (req, res) => {
       target
     );
 
-    // ✅ FIX: cancel limit order FIRST, then market sell — prevents double-sell
     const timeout = setTimeout(async () => {
       if (!activeTrade) return;
       console.log("⏰ Time stop — cancelling limit order and selling at market");
       const trade = activeTrade;
-      activeTrade = null; // clear first to stop the sell watcher
+      activeTrade = null;
       await cancelOrder(trade.sellId);
       await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
     }, TIME_STOP_MIN * 60000);
@@ -232,23 +247,101 @@ app.post("/webhook", async (req, res) => {
       timeout,
     };
 
-    // Start watching for the profit-target fill
     startSellWatcher(activeTrade);
 
     console.log(`✅ TRADE OPEN ${entry} → ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
     res.json({ ok: true, entry, target });
 
   } catch (err) {
-    console.error("❌ ERROR:", err);
+    console.error("❌ ERROR:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 // ─── CONTROL ROUTES ─────────────────────────────
-app.post("/pause",  (req, res) => { botPaused = true;  res.json({ paused: true }); });
-app.post("/resume", (req, res) => { botPaused = false; res.json({ paused: false }); });
-app.post("/skip",   (req, res) => { skipNext = true;   res.json({ skipNext: true }); });
-app.get("/status",  (req, res) => res.json({ activeTrade, botPaused, skipNext, earlyBird }));
+app.post("/pause", (req, res) => {
+  botPaused = true;
+  console.log("⏸️ Bot paused");
+  res.json({ paused: true });
+});
+
+app.post("/resume", (req, res) => {
+  botPaused = false;
+  console.log("▶️ Bot resumed");
+  res.json({ paused: false });
+});
+
+app.post("/skip", (req, res) => {
+  skipNext = true;
+  console.log("⏭️ Next signal will be skipped");
+  res.json({ skipNext: true });
+});
+
+app.get("/status", (req, res) => {
+  res.json({ activeTrade, botPaused, skipNext, earlyBird });
+});
+
+// ─── EARLYBIRD ──────────────────────────────────
+app.post("/earlybird", (req, res) => {
+  earlyBird = true;
+  console.log("🐦 earlyBird ON — next trade will fire outside time window");
+  res.json({ earlyBird: true });
+});
+
+// ─── BREAKEVEN ──────────────────────────────────
+app.post("/breakeven", async (req, res) => {
+  if (!activeTrade) return res.status(400).json({ error: "No active trade" });
+  try {
+    console.log("⚖️ Setting breakeven sell order...");
+    await cancelOrder(activeTrade.sellId);
+    const sell = await placeOrder(
+      activeTrade.symbol,
+      "sell_to_close",
+      CONTRACTS,
+      "limit",
+      activeTrade.entry
+    );
+    activeTrade.sellId = sell.id;
+    console.log(`⚖️ Breakeven set @ ${activeTrade.entry}`);
+    res.json({ ok: true, breakeven: activeTrade.entry });
+  } catch (err) {
+    console.error("❌ Breakeven error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── EXTEND ─────────────────────────────────────
+app.post("/extend", (req, res) => {
+  if (!activeTrade) return res.status(400).json({ error: "No active trade" });
+  clearTimeout(activeTrade.timeout);
+  activeTrade.timeout = setTimeout(async () => {
+    if (!activeTrade) return;
+    console.log("⏰ Extended time stop — cancelling limit and selling at market");
+    const trade = activeTrade;
+    activeTrade = null;
+    await cancelOrder(trade.sellId);
+    await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
+  }, TIME_STOP_MIN * 60000);
+  console.log(`⏱️ Timer reset to ${TIME_STOP_MIN} min`);
+  res.json({ ok: true, resetTo: TIME_STOP_MIN });
+});
+
+// ─── EMERGENCY ──────────────────────────────────
+app.post("/emergency", async (req, res) => {
+  if (!activeTrade) return res.status(400).json({ error: "No active trade" });
+  try {
+    console.log("🚨 EMERGENCY — selling all at market");
+    const trade = activeTrade;
+    activeTrade = null;
+    clearTimeout(trade.timeout);
+    await cancelOrder(trade.sellId);
+    await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
+    res.json({ ok: true, sold: "market" });
+  } catch (err) {
+    console.error("❌ Emergency error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─── SERVER ─────────────────────────────────────
 app.listen(process.env.PORT || 3000, () => {
