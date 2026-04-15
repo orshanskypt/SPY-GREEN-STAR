@@ -162,32 +162,46 @@ async function getFillPrice(orderId) {
   return null;
 }
 
+let sellWatcherInterval = null;
+
 function startSellWatcher(trade) {
-  const interval = setInterval(async () => {
-    if (!activeTrade || activeTrade.sellId !== trade.sellId) {
-      clearInterval(interval);
+  // Clear any existing watcher before starting a new one
+  if (sellWatcherInterval) {
+    clearInterval(sellWatcherInterval);
+    sellWatcherInterval = null;
+  }
+
+  sellWatcherInterval = setInterval(async () => {
+    // Always read sellId from activeTrade so breakeven updates are picked up
+    if (!activeTrade) {
+      clearInterval(sellWatcherInterval);
+      sellWatcherInterval = null;
       return;
     }
     try {
-      const order = await getOrderStatus(trade.sellId);
+      const order = await getOrderStatus(activeTrade.sellId);
       if (order.status === "filled") {
         console.log(`✅ PROFIT TARGET HIT — filled @ ${order.avg_fill_price}`);
         clearTimeout(activeTrade.timeout);
-        clearInterval(interval);
+        clearInterval(sellWatcherInterval);
+        sellWatcherInterval = null;
         activeTrade = null;
       } else if (order.status === "canceled" || order.status === "expired") {
-        console.warn(`⚠️ Sell order ${trade.sellId} is ${order.status} — closing at market`);
-        clearInterval(interval);
-        await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
-        clearTimeout(activeTrade?.timeout);
-        activeTrade = null;
+        // Only market sell if this wasn't intentionally cancelled (e.g. by breakeven/emergency)
+        if (activeTrade) {
+          console.warn(`⚠️ Sell order ${activeTrade.sellId} is ${order.status} — closing at market`);
+          clearInterval(sellWatcherInterval);
+          sellWatcherInterval = null;
+          const trade = activeTrade;
+          activeTrade = null;
+          clearTimeout(trade.timeout);
+          await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
+        }
       }
     } catch (err) {
       console.error("⚠️ Sell watcher error:", err.message);
     }
   }, SELL_POLL_INTERVAL_MS);
-
-  return interval;
 }
 
 // ─── WEBHOOK ────────────────────────────────────
@@ -302,6 +316,7 @@ app.post("/breakeven", async (req, res) => {
       activeTrade.entry
     );
     activeTrade.sellId = sell.id;
+    startSellWatcher(activeTrade); // restart watcher with new sellId
     console.log(`⚖️ Breakeven set @ ${activeTrade.entry}`);
     res.json({ ok: true, breakeven: activeTrade.entry });
   } catch (err) {
@@ -334,6 +349,7 @@ app.post("/emergency", async (req, res) => {
     const trade = activeTrade;
     activeTrade = null;
     clearTimeout(trade.timeout);
+    if (sellWatcherInterval) { clearInterval(sellWatcherInterval); sellWatcherInterval = null; }
     await cancelOrder(trade.sellId);
     await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
     res.json({ ok: true, sold: "market" });
