@@ -359,6 +359,53 @@ app.post("/emergency", async (req, res) => {
   }
 });
 
+// ─── FIRE (manual trade entry) ──────────────────
+app.post("/fire", async (req, res) => {
+  console.log("🔥 FIRE — manual trade triggered");
+  if (activeTrade) return res.status(400).json({ error: "Already in a trade" });
+
+  try {
+    const spy = await getSPYPrice();
+    console.log("SPY price:", spy);
+
+    const option = await getATMCall(spy);
+    console.log("Option selected:", option.symbol);
+
+    const buy = await placeOrder(option.symbol, "buy_to_open", CONTRACTS, "market");
+    const fill = await getFillPrice(buy.id);
+    console.log("Buy fill price:", fill);
+
+    const entry = fill ?? option.ask;
+    if (!entry || entry <= 0) {
+      throw new Error(`Cannot determine valid entry price (fill=${fill}, ask=${option.ask})`);
+    }
+
+    const target = +(entry * (1 + PROFIT_PCT)).toFixed(2);
+    console.log(`🎯 Entry: ${entry} → Target: ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
+
+    const sell = await placeOrder(option.symbol, "sell_to_close", CONTRACTS, "limit", target);
+
+    const timeout = setTimeout(async () => {
+      if (!activeTrade) return;
+      console.log("⏰ Time stop — cancelling limit and selling at market");
+      const trade = activeTrade;
+      activeTrade = null;
+      await cancelOrder(trade.sellId);
+      await placeOrder(trade.symbol, "sell_to_close", CONTRACTS, "market");
+    }, TIME_STOP_MIN * 60000);
+
+    activeTrade = { symbol: option.symbol, entry, sellId: sell.id, timeout };
+    startSellWatcher(activeTrade);
+
+    console.log(`✅ TRADE OPEN ${entry} → ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
+    res.json({ ok: true, entry, target });
+
+  } catch (err) {
+    console.error("❌ FIRE error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── SERVER ─────────────────────────────────────
 app.listen(process.env.PORT || 3000, () => {
   console.log(`🚀 BOT RUNNING — ${LIVE_MODE ? "🔴 LIVE" : "🟡 SANDBOX"}`);
