@@ -10,7 +10,7 @@ app.get('/healthz', (req, res) => res.send('OK'));
 
 // ─── CONFIG ─────────────────────────────────────
 const LIVE_MODE = process.env.LIVE_MODE === "true";
-const CONTRACTS = 2;
+const CONTRACTS = 3;
 const PROFIT_PCT = 0.08;
 const TIME_STOP_MIN = 30;
 const SELL_POLL_INTERVAL_MS = 10000;
