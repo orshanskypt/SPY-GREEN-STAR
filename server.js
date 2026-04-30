@@ -180,18 +180,37 @@ async function getFillPrice(orderId) {
   return null;
 }
 // ─── TRADE OPENER (shared by /webhook and /fire) ───
-// Sizes position dynamically from real buying power, up to MAX_CONTRACTS.
-// Returns { skipped: true, reason } if we can't afford anything.
-async function openTrade() {
+// If `requestedQty` is null/undefined → auto-size from buying power, capped at MAX_CONTRACTS.
+// If `requestedQty` is a number → use exactly that many contracts, but still verify BP can cover it.
+// Returns { skipped: true, reason } if we can't afford the trade.
+async function openTrade(requestedQty = null) {
   const spy = await getSPYPrice();
   console.log("SPY price:", spy);
   const option = await getATMCall(spy);
   console.log("Option selected:", option.symbol);
-  // 💰 Dynamic sizing
   const bp  = await getOptionBuyingPower();
   const ask = parseFloat(option.ask);
-  const qty = calcContracts(ask, bp);
-  console.log(`💵 BP: $${bp.toFixed(2)}  |  ask: $${ask}  |  sized qty: ${qty} (max ${MAX_CONTRACTS})`);
+  let qty;
+  if (requestedQty == null) {
+    // 💰 Auto-size
+    qty = calcContracts(ask, bp);
+    console.log(`💵 BP: $${bp.toFixed(2)}  |  ask: $${ask}  |  auto-sized qty: ${qty} (max ${MAX_CONTRACTS})`);
+  } else {
+    // 🎯 Explicit qty — but still BP-check it
+    const affordable = calcContracts(ask, bp);
+    if (requestedQty > MAX_CONTRACTS) {
+      const reason = `Requested ${requestedQty} exceeds MAX_CONTRACTS (${MAX_CONTRACTS})`;
+      console.log("⛔", reason);
+      return { skipped: true, reason, bp, ask, requestedQty };
+    }
+    if (requestedQty > affordable) {
+      const reason = `Requested ${requestedQty} contracts but BP only supports ${affordable} (BP $${bp.toFixed(2)}, ask $${ask})`;
+      console.log("⛔", reason);
+      return { skipped: true, reason, bp, ask, requestedQty, affordable };
+    }
+    qty = requestedQty;
+    console.log(`💵 BP: $${bp.toFixed(2)}  |  ask: $${ask}  |  explicit qty: ${qty}`);
+  }
   if (qty === 0) {
     const reason = `Insufficient buying power: $${bp.toFixed(2)} available, need $${(ask * 100).toFixed(2)} for 1 contract`;
     console.log("⛔", reason);
@@ -384,11 +403,31 @@ app.all("/emergency", async (req, res) => {
   }
 });
 // ─── FIRE (manual trade entry) ──────────────────
-app.all("/fire", async (req, res) => {
-  console.log("🔥 FIRE — manual trade triggered");
+// /fire           → auto-size based on buying power (capped at MAX_CONTRACTS)
+// /fire1 .. /fire5 → fire with exactly N contracts (still BP-checked, will refuse if insufficient)
+// /fire/:n        → same idea via path param (e.g. /fire/3)
+app.all(/^\/fire([1-9][0-9]?)?$/, async (req, res) => {
+  // The captured digit is in req.params[0] for the regex form
+  const captured = req.params[0];
+  const requestedQty = captured ? parseInt(captured, 10) : null;
+  console.log(`🔥 FIRE — manual trade triggered${requestedQty ? ` (qty=${requestedQty})` : " (auto-size)"}`);
   if (activeTrade) return res.status(400).json({ error: "Already in a trade" });
   try {
-    const result = await openTrade();
+    const result = await openTrade(requestedQty);
+    if (result.skipped) return res.status(400).json({ error: result.reason, ...result });
+    res.json(result);
+  } catch (err) {
+    console.error("❌ FIRE error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+// Path-param form for cleaner URLs: /fire/3
+app.all("/fire/:qty(\\d+)", async (req, res) => {
+  const requestedQty = parseInt(req.params.qty, 10);
+  console.log(`🔥 FIRE — manual trade triggered (qty=${requestedQty})`);
+  if (activeTrade) return res.status(400).json({ error: "Already in a trade" });
+  try {
+    const result = await openTrade(requestedQty);
     if (result.skipped) return res.status(400).json({ error: result.reason, ...result });
     res.json(result);
   } catch (err) {
