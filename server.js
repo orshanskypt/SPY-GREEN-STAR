@@ -291,17 +291,18 @@ app.post("/webhook", async (req, res) => {
   }
 });
 // ─── CONTROL ROUTES ─────────────────────────────
-app.post("/pause", (req, res) => {
+// Use app.all so these work via browser (GET) AND curl/webhook (POST)
+app.all("/pause", (req, res) => {
   botPaused = true;
   console.log("⏸️ Bot paused");
   res.json({ paused: true });
 });
-app.post("/resume", (req, res) => {
+app.all("/resume", (req, res) => {
   botPaused = false;
   console.log("▶️ Bot resumed");
   res.json({ paused: false });
 });
-app.post("/skip", (req, res) => {
+app.all("/skip", (req, res) => {
   skipNext = true;
   console.log("⏭️ Next signal will be skipped");
   res.json({ skipNext: true });
@@ -323,13 +324,13 @@ app.get("/sizing", async (req, res) => {
   }
 });
 // ─── EARLYBIRD ──────────────────────────────────
-app.post("/earlybird", (req, res) => {
+app.all("/earlybird", (req, res) => {
   earlyBird = true;
   console.log("🐦 earlyBird ON — next trade will fire outside time window");
   res.json({ earlyBird: true });
 });
 // ─── BREAKEVEN ──────────────────────────────────
-app.post("/breakeven", async (req, res) => {
+app.all("/breakeven", async (req, res) => {
   if (!activeTrade) return res.status(400).json({ error: "No active trade" });
   try {
     console.log("⚖️ Setting breakeven sell order...");
@@ -351,7 +352,7 @@ app.post("/breakeven", async (req, res) => {
   }
 });
 // ─── EXTEND ─────────────────────────────────────
-app.post("/extend", (req, res) => {
+app.all("/extend", (req, res) => {
   if (!activeTrade) return res.status(400).json({ error: "No active trade" });
   clearTimeout(activeTrade.timeout);
   activeTrade.timeout = setTimeout(async () => {
@@ -366,7 +367,7 @@ app.post("/extend", (req, res) => {
   res.json({ ok: true, resetTo: TIME_STOP_MIN });
 });
 // ─── EMERGENCY ──────────────────────────────────
-app.post("/emergency", async (req, res) => {
+app.all("/emergency", async (req, res) => {
   if (!activeTrade) return res.status(400).json({ error: "No active trade" });
   try {
     console.log("🚨 EMERGENCY — selling all at market");
@@ -383,7 +384,7 @@ app.post("/emergency", async (req, res) => {
   }
 });
 // ─── FIRE (manual trade entry) ──────────────────
-app.post("/fire", async (req, res) => {
+app.all("/fire", async (req, res) => {
   console.log("🔥 FIRE — manual trade triggered");
   if (activeTrade) return res.status(400).json({ error: "Already in a trade" });
   try {
