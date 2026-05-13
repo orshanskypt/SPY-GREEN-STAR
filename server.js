@@ -25,6 +25,9 @@ let activeTrade = null;
 let botPaused = false;
 let skipNext = false;
 let earlyBird = false;
+let earlyBirdTimer = null;    // auto-expires the earlyBird flag
+let tradingLock = false;      // synchronous lock: prevents concurrent openTrade() calls
+const EARLYBIRD_TTL_MIN = 90; // earlyBird auto-clears after this many minutes if no signal
 // ─── HELPERS ────────────────────────────────────
 async function tradierRequest(method, path, params = {}) {
   const res = await fetch(`${BASE_URL}${path}`, {
@@ -183,7 +186,21 @@ async function getFillPrice(orderId) {
 // If `requestedQty` is null/undefined → auto-size from buying power, capped at MAX_CONTRACTS.
 // If `requestedQty` is a number → use exactly that many contracts, but still verify BP can cover it.
 // Returns { skipped: true, reason } if we can't afford the trade.
+//
+// 🔒 SYNCHRONOUS LOCK: set immediately to prevent a second concurrent caller from
+// passing the activeTrade check while we're awaiting on Tradier (e.g. /fire2 double-click).
 async function openTrade(requestedQty = null) {
+  if (tradingLock) {
+    return { skipped: true, reason: "trade already in progress (lock held)" };
+  }
+  tradingLock = true;
+  // 🐦 Any successful entry path consumes earlyBird — covers /webhook AND /fire.
+  if (earlyBird) {
+    earlyBird = false;
+    if (earlyBirdTimer) { clearTimeout(earlyBirdTimer); earlyBirdTimer = null; }
+    console.log("🐦 earlyBird consumed and reset");
+  }
+  try {
   const spy = await getSPYPrice();
   console.log("SPY price:", spy);
   const option = await getATMCall(spy);
@@ -249,6 +266,9 @@ async function openTrade(requestedQty = null) {
   startSellWatcher(activeTrade);
   console.log(`✅ TRADE OPEN  qty=${qty}  entry=${entry} → ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
   return { ok: true, qty, entry, target, bp };
+  } finally {
+    tradingLock = false;
+  }
 }
 let sellWatcherInterval = null;
 function startSellWatcher(trade) {
@@ -295,11 +315,7 @@ app.post("/webhook", async (req, res) => {
   if (skipNext) { skipNext = false; return res.json({ skip: "skipNext" }); }
   if (!earlyBird && !isInTradingWindow()) return res.json({ skip: "time" });
   if (activeTrade) return res.json({ skip: "active trade" });
-  // earlyBird is one-shot — reset after passing the gate
-  if (earlyBird) {
-    earlyBird = false;
-    console.log("🐦 earlyBird used — resetting to false");
-  }
+  // earlyBird reset moved into openTrade() so /fire also clears it.
   try {
     const result = await openTrade();
     if (result.skipped) return res.json({ skip: "no_bp", ...result });
@@ -343,10 +359,27 @@ app.get("/sizing", async (req, res) => {
   }
 });
 // ─── EARLYBIRD ──────────────────────────────────
+// Sets a one-shot flag that lets the next signal bypass the trading-window gate.
+// Auto-expires after EARLYBIRD_TTL_MIN minutes so it can't leak into the afternoon.
 app.all("/earlybird", (req, res) => {
   earlyBird = true;
-  console.log("🐦 earlyBird ON — next trade will fire outside time window");
-  res.json({ earlyBird: true });
+  if (earlyBirdTimer) clearTimeout(earlyBirdTimer);
+  earlyBirdTimer = setTimeout(() => {
+    if (earlyBird) {
+      earlyBird = false;
+      console.log(`🐦 earlyBird auto-expired after ${EARLYBIRD_TTL_MIN} min`);
+    }
+    earlyBirdTimer = null;
+  }, EARLYBIRD_TTL_MIN * 60000);
+  console.log(`🐦 earlyBird ON — expires in ${EARLYBIRD_TTL_MIN} min`);
+  res.json({ earlyBird: true, expiresInMin: EARLYBIRD_TTL_MIN });
+});
+// Manual reset, in case you want to cancel an armed earlybird.
+app.all("/earlybird/off", (req, res) => {
+  earlyBird = false;
+  if (earlyBirdTimer) { clearTimeout(earlyBirdTimer); earlyBirdTimer = null; }
+  console.log("🐦 earlyBird manually cleared");
+  res.json({ earlyBird: false });
 });
 // ─── BREAKEVEN ──────────────────────────────────
 app.all("/breakeven", async (req, res) => {
