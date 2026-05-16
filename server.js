@@ -7,12 +7,25 @@ app.get('/ping', (req, res) => res.send('OK'));
 app.get('/healthz', (req, res) => res.send('OK'));
 // ─── CONFIG ─────────────────────────────────────
 const LIVE_MODE = process.env.LIVE_MODE === "true";
-const MAX_CONTRACTS = 5;            // hard ceiling per trade
+const MAX_CONTRACTS = 6;            // hard ceiling per trade
 const MIN_CONTRACTS = 1;            // must afford at least 1 or skip
 const BP_BUFFER_PCT = 0.02;         // leave 2% headroom so a small fill drift doesn't reject
-const PROFIT_PCT = 0.08;
+const PROFIT_PCT = 0.08;            // core profit target
 const TIME_STOP_MIN = 30;
 const SELL_POLL_INTERVAL_MS = 10000;
+// ── Runner config (true trailing runner) ──
+const RUNNER_ENABLED      = true;
+const RUNNER_MIN_QTY      = 2;
+const RUNNER_GIVEBACK_PCT = 0.40;   // stop = entry + gain×(1−this); floored at entry
+// ── Mid tier config ──
+const MID_ENABLED    = true;
+const MID_MIN_QTY    = 6;
+const MID_TARGET_PCT = 0.12;        // mid limit-sell target (+12%)
+const MID_STOP_PCT   = 0.08;        // mid virtual stop, activated AFTER core fills
+// ── EOD failsafe ──
+// 0DTE protection: when mid/runner are riding (no time limit), force-close any open legs
+// at this ET time so they don't expire worthless. Set well before 4:00 PM SPY settle.
+const EOD_FAILSAFE_HHMM_ET = [15, 50]; // 3:50 PM ET
 const BASE_URL = LIVE_MODE
   ? "https://api.tradier.com/v1"
   : "https://sandbox.tradier.com/v1";
@@ -64,6 +77,14 @@ function isInTradingWindow() {
   const { hour, minute } = getETTime();
   const mins = hour * 60 + minute;
   return mins >= 645 && mins <= 900;
+}
+// ms remaining until the EOD failsafe time today, or 0 if we've already passed it.
+function msUntilEodEt() {
+  const { hour, minute } = getETTime();
+  const nowMins    = hour * 60 + minute;
+  const targetMins = EOD_FAILSAFE_HHMM_ET[0] * 60 + EOD_FAILSAFE_HHMM_ET[1];
+  if (nowMins >= targetMins) return 0;
+  return (targetMins - nowMins) * 60_000;
 }
 // ─── MARKET FUNCTIONS ───────────────────────────
 async function getTodayExpiration() {
@@ -182,6 +203,20 @@ async function getFillPrice(orderId) {
   }
   return null;
 }
+// Quote helper used by the runner-trailing logic. Tries `last`, then mid of bid/ask.
+async function getOptionPrice(symbol) {
+  const data = await tradierRequest("GET", `/markets/quotes?symbols=${encodeURIComponent(symbol)}`);
+  const q = data?.quotes?.quote;
+  if (!q) throw new Error(`No quote for ${symbol}`);
+  const last = parseFloat(q.last);
+  if (Number.isFinite(last) && last > 0) return last;
+  const bid = parseFloat(q.bid);
+  const ask = parseFloat(q.ask);
+  if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) {
+    return (bid + ask) / 2;
+  }
+  throw new Error(`Unusable quote for ${symbol}: ${JSON.stringify(q)}`);
+}
 // ─── TRADE OPENER (shared by /webhook and /fire) ───
 // If `requestedQty` is null/undefined → auto-size from buying power, capped at MAX_CONTRACTS.
 // If `requestedQty` is a number → use exactly that many contracts, but still verify BP can cover it.
@@ -233,7 +268,7 @@ async function openTrade(requestedQty = null) {
     console.log("⛔", reason);
     return { skipped: true, reason, bp, ask };
   }
-  // 🟢 Buy
+  // 🟢 Buy (single market order for the full qty)
   const buy = await placeOrder(option.symbol, "buy_to_open", qty, "market");
   const fill = await getFillPrice(buy.id);
   console.log("Buy fill price:", fill);
@@ -241,70 +276,258 @@ async function openTrade(requestedQty = null) {
   if (!entry || entry <= 0) {
     throw new Error(`Cannot determine valid entry price (fill=${fill}, ask=${ask})`);
   }
-  const target = +(entry * (1 + PROFIT_PCT)).toFixed(2);
-  console.log(`🎯 Entry: ${entry} → Target: ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
-  // 🎯 Limit sell
-  const sell = await placeOrder(option.symbol, "sell_to_close", qty, "limit", target);
-  // ⏰ Time stop — cancel limit first, then market out (uses trade.qty, not a constant)
+  // 🪓 Split: core (+8% limit) / mid (+12% limit, +8% stop after core) / runner (trailing)
+  const useRunner = RUNNER_ENABLED && qty >= RUNNER_MIN_QTY;
+  const useMid    = MID_ENABLED    && qty >= MID_MIN_QTY;
+  const runnerQty = useRunner ? 1 : 0;
+  const midQty    = useMid    ? 1 : 0;
+  const coreQty   = qty - runnerQty - midQty;
+  if (coreQty < 1) {
+    throw new Error(`Tier split produced coreQty<1 (qty=${qty}, mid=${midQty}, runner=${runnerQty})`);
+  }
+  const coreTarget = +(entry * (1 + PROFIT_PCT)).toFixed(2);
+  const midTarget  = useMid ? +(entry * (1 + MID_TARGET_PCT)).toFixed(2) : null;
+  const midStop    = useMid ? +(entry * (1 + MID_STOP_PCT)).toFixed(2)   : null;
+  console.log(
+    `🎯 Entry: ${entry}  |  ` +
+    `Core(${coreQty}) → ${coreTarget} (+${(PROFIT_PCT*100).toFixed(0)}%)` +
+    (useMid ? `  |  Mid(${midQty}) → ${midTarget} (+${(MID_TARGET_PCT*100).toFixed(0)}%) / stop ${midStop} (+${(MID_STOP_PCT*100).toFixed(0)}% after core)` : "") +
+    (useRunner ? `  |  Runner(${runnerQty}) → trail ${(RUNNER_GIVEBACK_PCT*100).toFixed(0)}% giveback` : "")
+  );
+  // Place CORE limit. Place MID limit (no stop yet — that activates virtually after core fills).
+  // Runner has no resting order — fully virtual.
+  const coreSell = await placeOrder(option.symbol, "sell_to_close", coreQty, "limit", coreTarget);
+  let midSellId = null;
+  if (useMid) {
+    const midSell = await placeOrder(option.symbol, "sell_to_close", midQty, "limit", midTarget);
+    midSellId = midSell.id;
+  }
+  // ⏰ Time stop — "did the trade work?" gate.
+  //    If core +8% has NOT filled within TIME_STOP_MIN min, the move never
+  //    developed → close ALL legs (core + mid + runner) at market and walk away.
+  //    If core HAS filled, do nothing here: mid + runner ride freely on their
+  //    own exits (limit / virtual stop / trailing), backed by the EOD failsafe.
   const timeout = setTimeout(async () => {
     if (!activeTrade) return;
-    console.log("⏰ Time stop — cancelling limit order and selling at market");
+    const trade = activeTrade;
+    if (!trade.core || trade.core.filled) return; // core already hit +8% — let mid/runner ride
+    console.log("⏰ 30-min time stop, core never filled — closing ALL legs at market");
+    activeTrade = null;
+    if (trade.eodTimeout) clearTimeout(trade.eodTimeout);
+    stopWatcher();
+    // Core
+    try { await cancelOrder(trade.core.sellId); } catch {}
+    try { await placeOrder(trade.symbol, "sell_to_close", trade.core.qty, "market"); }
+    catch (e) { console.log("core market-sell err:", e.message); }
+    trade.core.filled = true;
+    // Mid
+    if (trade.mid && !trade.mid.closed) {
+      try { await cancelOrder(trade.mid.sellId); } catch {}
+      try { await placeOrder(trade.symbol, "sell_to_close", trade.mid.qty, "market"); }
+      catch (e) { console.log("mid market-sell err:", e.message); }
+      trade.mid.closed = true;
+    }
+    // Runner
+    if (trade.runner && !trade.runner.closed && trade.runner.qty > 0) {
+      try { await placeOrder(trade.symbol, "sell_to_close", trade.runner.qty, "market"); }
+      catch (e) { console.log("runner market-sell err:", e.message); }
+      trade.runner.closed = true;
+    }
+    console.log("⏰ Time-stop flush complete — flat.");
+  }, TIME_STOP_MIN * 60000);
+  // 🌅 EOD failsafe — final safety net for any leg still open near close
+  const eodMs = msUntilEodEt();
+  const eodTimeout = eodMs > 0 ? setTimeout(async () => {
+    if (!activeTrade) return;
+    console.log("🌅 EOD failsafe firing — closing any open legs");
     const trade = activeTrade;
     activeTrade = null;
-    await cancelOrder(trade.sellId);
-    await placeOrder(trade.symbol, "sell_to_close", trade.qty, "market");
-  }, TIME_STOP_MIN * 60000);
+    clearTimeout(trade.timeout);
+    stopWatcher();
+    if (trade.core && !trade.core.filled) {
+      try { await cancelOrder(trade.core.sellId); } catch {}
+      await placeOrder(trade.symbol, "sell_to_close", trade.core.qty, "market");
+    }
+    if (trade.mid && !trade.mid.closed) {
+      try { await cancelOrder(trade.mid.sellId); } catch {}
+      await placeOrder(trade.symbol, "sell_to_close", trade.mid.qty, "market");
+    }
+    if (trade.runner && !trade.runner.closed && trade.runner.qty > 0) {
+      await placeOrder(trade.symbol, "sell_to_close", trade.runner.qty, "market");
+    }
+  }, eodMs) : null;
+  if (eodMs > 0) {
+    console.log(`🌅 EOD failsafe armed in ${Math.round(eodMs/60000)} min (${EOD_FAILSAFE_HHMM_ET.join(":")} ET)`);
+  } else {
+    console.log("🌅 EOD failsafe NOT armed (already past failsafe time)");
+  }
   activeTrade = {
     symbol: option.symbol,
-    qty,                 // ← persisted so every sell path uses the right size
+    qty,
     entry,
-    target,
-    sellId: sell.id,
-    timeout,
     openedAt: Date.now(),
+    timeout,
+    eodTimeout,
+    core: {
+      qty: coreQty,
+      target: coreTarget,
+      sellId: coreSell.id,
+      filled: false,
+    },
+    mid: useMid ? {
+      qty: midQty,
+      target: midTarget,
+      sellId: midSellId,
+      stopLevel: midStop,        // +8% above entry — activated after core fills
+      stopActivated: false,
+      closed: false,
+    } : null,
+    runner: useRunner ? {
+      qty: runnerQty,
+      activated: false,           // true once core fills
+      high: entry,                // running max since activation
+      stop: null,                 // virtual trailing stop level (giveback math)
+      closed: false,
+    } : null,
   };
-  startSellWatcher(activeTrade);
-  console.log(`✅ TRADE OPEN  qty=${qty}  entry=${entry} → ${target} (+${(PROFIT_PCT * 100).toFixed(0)}%)`);
-  return { ok: true, qty, entry, target, bp };
+  startSellWatcher();
+  console.log(`✅ TRADE OPEN  total=${qty} (core=${coreQty}, mid=${midQty}, runner=${runnerQty})  entry=${entry}`);
+  return { ok: true, qty, entry, coreTarget, coreQty, midQty, midTarget, runnerQty, bp };
   } finally {
     tradingLock = false;
   }
 }
 let sellWatcherInterval = null;
-function startSellWatcher(trade) {
-  // Clear any existing watcher before starting a new one
+function stopWatcher() {
   if (sellWatcherInterval) {
     clearInterval(sellWatcherInterval);
     sellWatcherInterval = null;
   }
+}
+// Watcher runs every SELL_POLL_INTERVAL_MS and manages all three legs:
+//   1) Core limit — when it fills, activate mid stop and runner trailing.
+//   2) Mid limit — track fills/cancels. If stop is activated and price ≤ stop, cancel + market sell.
+//   3) Runner — virtual trailing stop using profit-giveback math, floored at breakeven.
+//   4) Cleanup when every leg is resolved.
+function startSellWatcher() {
+  stopWatcher();
   sellWatcherInterval = setInterval(async () => {
-    // Always read sellId from activeTrade so breakeven updates are picked up
-    if (!activeTrade) {
-      clearInterval(sellWatcherInterval);
-      sellWatcherInterval = null;
-      return;
-    }
+    if (!activeTrade) { stopWatcher(); return; }
+    const t = activeTrade;
     try {
-      const order = await getOrderStatus(activeTrade.sellId);
-      if (order.status === "filled") {
-        console.log(`✅ PROFIT TARGET HIT — filled @ ${order.avg_fill_price}`);
-        clearTimeout(activeTrade.timeout);
-        clearInterval(sellWatcherInterval);
-        sellWatcherInterval = null;
-        activeTrade = null;
-      } else if (order.status === "canceled" || order.status === "expired") {
-        if (activeTrade) {
-          console.warn(`⚠️ Sell order ${activeTrade.sellId} is ${order.status} — closing at market`);
-          clearInterval(sellWatcherInterval);
-          sellWatcherInterval = null;
-          const trade = activeTrade;
-          activeTrade = null;
-          clearTimeout(trade.timeout);
-          await placeOrder(trade.symbol, "sell_to_close", trade.qty, "market");
+      // ── 1. Core monitoring ──────────────────────────────
+      if (t.core && !t.core.filled) {
+        const order = await getOrderStatus(t.core.sellId);
+        if (order.status === "filled") {
+          console.log(`✅ CORE FILLED @ ${order.avg_fill_price} (qty ${t.core.qty})`);
+          t.core.filled = true;
+          // Activate mid stop (locks in +8% on the mid contract)
+          if (t.mid && !t.mid.stopActivated && !t.mid.closed) {
+            t.mid.stopActivated = true;
+            console.log(`🛡️ MID STOP ARMED at ${t.mid.stopLevel} (+${(MID_STOP_PCT*100).toFixed(0)}%)`);
+          }
+          // Activate runner trailing
+          if (t.runner && !t.runner.activated) {
+            t.runner.activated = true;
+            t.runner.high = Math.max(t.entry, parseFloat(order.avg_fill_price) || t.entry);
+            t.runner.stop = t.entry; // BE floor
+            console.log(`🏃 RUNNER ACTIVATED  high=${t.runner.high}  stop=${t.runner.stop} (BE)`);
+          }
+        } else if (order.status === "canceled" || order.status === "expired") {
+          console.warn(`⚠️ Core order ${order.status} — market-closing core`);
+          const coreQty = t.core.qty;
+          t.core.filled = true; // resolved
+          await placeOrder(t.symbol, "sell_to_close", coreQty, "market");
+          // Activate downstream legs anyway with BE protection
+          if (t.mid && !t.mid.stopActivated && !t.mid.closed) {
+            t.mid.stopActivated = true;
+            console.log(`🛡️ MID STOP ARMED (after core cancel) at ${t.mid.stopLevel}`);
+          }
+          if (t.runner && !t.runner.activated) {
+            t.runner.activated = true;
+            t.runner.high = t.entry;
+            t.runner.stop = t.entry;
+            console.log(`🏃 RUNNER ACTIVATED (after core cancel)  stop=${t.entry}`);
+          }
         }
       }
+      // ── 2a. Mid limit-fill check ────────────────────────
+      if (t.mid && !t.mid.closed) {
+        const order = await getOrderStatus(t.mid.sellId);
+        if (order.status === "filled") {
+          console.log(`✅ MID TARGET HIT — filled @ ${order.avg_fill_price} (qty ${t.mid.qty})`);
+          t.mid.closed = true;
+        } else if (order.status === "canceled" || order.status === "expired") {
+          // Already handled by stop logic below if we cancelled it ourselves.
+          // If it canceled unexpectedly, market-close so we don't leak.
+          if (!t.mid.closed) {
+            console.warn(`⚠️ Mid order ${order.status} unexpectedly — market-closing mid`);
+            t.mid.closed = true;
+            await placeOrder(t.symbol, "sell_to_close", t.mid.qty, "market");
+          }
+        }
+      }
+      // ── 2b. Mid stop check (only after core fills) ──────
+      const needPrice = (t.mid && t.mid.stopActivated && !t.mid.closed)
+                     || (t.runner && t.runner.activated && !t.runner.closed && t.runner.qty > 0);
+      let price = null;
+      if (needPrice) {
+        try {
+          price = await getOptionPrice(t.symbol);
+        } catch (e) {
+          console.warn("⚠️ Quote fetch failed:", e.message);
+        }
+      }
+      if (price != null && t.mid && t.mid.stopActivated && !t.mid.closed) {
+        if (price <= t.mid.stopLevel) {
+          console.log(`🛑 MID STOP HIT — price ${price} ≤ ${t.mid.stopLevel}, cancelling limit + market-selling`);
+          t.mid.closed = true;
+          try {
+            await cancelOrder(t.mid.sellId);
+            await placeOrder(t.symbol, "sell_to_close", t.mid.qty, "market");
+          } catch (e) {
+            console.error("❌ Mid stop sell failed:", e.message);
+            t.mid.closed = false; // retry next tick
+          }
+        }
+      }
+      // ── 3. Runner trailing (40% profit giveback) ────────
+      if (price != null && t.runner && t.runner.activated && !t.runner.closed && t.runner.qty > 0) {
+        if (price > t.runner.high) {
+          t.runner.high = price;
+          // stop = entry + (high − entry) × (1 − GIVEBACK), floored at entry
+          const gain = t.runner.high - t.entry;
+          const candidate = +(t.entry + gain * (1 - RUNNER_GIVEBACK_PCT)).toFixed(2);
+          const newStop = Math.max(t.entry, candidate);
+          if (newStop > t.runner.stop) {
+            t.runner.stop = newStop;
+            console.log(`📈 Runner trail raised: high=${t.runner.high}  stop=${t.runner.stop} (locked in $${(t.runner.stop - t.entry).toFixed(2)} / contract)`);
+          }
+        }
+        if (price <= t.runner.stop) {
+          console.log(`🛑 Runner trail HIT — price ${price} ≤ stop ${t.runner.stop}, market-selling`);
+          t.runner.closed = true;
+          try {
+            await placeOrder(t.symbol, "sell_to_close", t.runner.qty, "market");
+          } catch (e) {
+            console.error("❌ Runner market sell failed:", e.message);
+            t.runner.closed = false; // retry next tick
+          }
+        }
+      }
+      // ── 4. Cleanup ──────────────────────────────────────
+      const coreDone   = !t.core   || t.core.filled;
+      const midDone    = !t.mid    || t.mid.closed;
+      const runnerDone = !t.runner || t.runner.closed || t.runner.qty === 0;
+      if (coreDone && midDone && runnerDone) {
+        console.log("🏁 Trade fully closed");
+        clearTimeout(t.timeout);
+        if (t.eodTimeout) clearTimeout(t.eodTimeout);
+        stopWatcher();
+        activeTrade = null;
+      }
     } catch (err) {
-      console.error("⚠️ Sell watcher error:", err.message);
+      console.error("⚠️ Watcher error:", err.message);
     }
   }, SELL_POLL_INTERVAL_MS);
 }
@@ -343,9 +566,20 @@ app.all("/skip", (req, res) => {
   res.json({ skipNext: true });
 });
 app.get("/status", (req, res) => {
-  res.json({ activeTrade, botPaused, skipNext, earlyBird, maxContracts: MAX_CONTRACTS });
+  res.json({
+    activeTrade,
+    botPaused,
+    skipNext,
+    earlyBird,
+    maxContracts: MAX_CONTRACTS,
+    config: {
+      profitPct: PROFIT_PCT,
+      midEnabled: MID_ENABLED, midMinQty: MID_MIN_QTY, midTargetPct: MID_TARGET_PCT, midStopPct: MID_STOP_PCT,
+      runnerEnabled: RUNNER_ENABLED, runnerMinQty: RUNNER_MIN_QTY, runnerGivebackPct: RUNNER_GIVEBACK_PCT,
+    },
+  });
 });
-// Quick sanity endpoint — tells you exactly what the bot would size a trade at right now.
+// Quick sanity endpoint — shows what the bot would size & split RIGHT NOW.
 app.get("/sizing", async (req, res) => {
   try {
     const spy    = await getSPYPrice();
@@ -353,7 +587,16 @@ app.get("/sizing", async (req, res) => {
     const bp     = await getOptionBuyingPower();
     const ask    = parseFloat(option.ask);
     const qty    = calcContracts(ask, bp);
-    res.json({ spy, strike: option.strike, ask, bp, qty, maxContracts: MAX_CONTRACTS });
+    const useRunner = RUNNER_ENABLED && qty >= RUNNER_MIN_QTY;
+    const useMid    = MID_ENABLED    && qty >= MID_MIN_QTY;
+    const runnerQty = useRunner ? 1 : 0;
+    const midQty    = useMid    ? 1 : 0;
+    const coreQty   = qty - runnerQty - midQty;
+    res.json({
+      spy, strike: option.strike, ask, bp,
+      qty, coreQty, midQty, runnerQty,
+      maxContracts: MAX_CONTRACTS,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -382,22 +625,41 @@ app.all("/earlybird/off", (req, res) => {
   res.json({ earlyBird: false });
 });
 // ─── BREAKEVEN ──────────────────────────────────
+// Pulls every still-open leg back to entry so the worst case is BE.
+// • Core (unfilled): cancel + replace limit at entry
+// • Mid (open):      cancel + replace limit at entry, AND arm stop at entry
+// • Runner (active): pin trailing-stop floor at entry
 app.all("/breakeven", async (req, res) => {
   if (!activeTrade) return res.status(400).json({ error: "No active trade" });
+  const t = activeTrade;
   try {
-    console.log("⚖️ Setting breakeven sell order...");
-    await cancelOrder(activeTrade.sellId);
-    const sell = await placeOrder(
-      activeTrade.symbol,
-      "sell_to_close",
-      activeTrade.qty,           // ← dynamic qty
-      "limit",
-      activeTrade.entry
-    );
-    activeTrade.sellId = sell.id;
-    startSellWatcher(activeTrade); // restart watcher with new sellId
-    console.log(`⚖️ Breakeven set @ ${activeTrade.entry}`);
-    res.json({ ok: true, breakeven: activeTrade.entry, qty: activeTrade.qty });
+    console.log("⚖️ Setting breakeven across all legs...");
+    const result = { ok: true };
+    if (t.core && !t.core.filled) {
+      await cancelOrder(t.core.sellId);
+      const sell = await placeOrder(t.symbol, "sell_to_close", t.core.qty, "limit", t.entry);
+      t.core.sellId = sell.id;
+      t.core.target = t.entry;
+      result.core = { qty: t.core.qty, target: t.entry };
+      console.log(`⚖️ Core sell moved to BE @ ${t.entry}`);
+    }
+    if (t.mid && !t.mid.closed) {
+      await cancelOrder(t.mid.sellId);
+      const sell = await placeOrder(t.symbol, "sell_to_close", t.mid.qty, "limit", t.entry);
+      t.mid.sellId = sell.id;
+      t.mid.target = t.entry;
+      t.mid.stopLevel = t.entry;
+      t.mid.stopActivated = true;
+      result.mid = { qty: t.mid.qty, target: t.entry, stop: t.entry };
+      console.log(`⚖️ Mid moved to BE @ ${t.entry} (stop also armed at BE)`);
+    }
+    if (t.runner && t.runner.activated && !t.runner.closed) {
+      t.runner.stop = Math.max(t.runner.stop || 0, t.entry);
+      result.runner = { qty: t.runner.qty, stop: t.runner.stop };
+      console.log(`⚖️ Runner trail floor pinned at BE ${t.runner.stop}`);
+    }
+    startSellWatcher();
+    res.json(result);
   } catch (err) {
     console.error("❌ Breakeven error:", err.message);
     res.status(500).json({ error: err.message });
@@ -409,27 +671,59 @@ app.all("/extend", (req, res) => {
   clearTimeout(activeTrade.timeout);
   activeTrade.timeout = setTimeout(async () => {
     if (!activeTrade) return;
-    console.log("⏰ Extended time stop — cancelling limit and selling at market");
     const trade = activeTrade;
+    if (!trade.core || trade.core.filled) return; // core hit +8% — let mid/runner ride
+    console.log("⏰ Extended time stop, core never filled — closing ALL legs at market");
     activeTrade = null;
-    await cancelOrder(trade.sellId);
-    await placeOrder(trade.symbol, "sell_to_close", trade.qty, "market");
+    if (trade.eodTimeout) clearTimeout(trade.eodTimeout);
+    stopWatcher();
+    try { await cancelOrder(trade.core.sellId); } catch {}
+    try { await placeOrder(trade.symbol, "sell_to_close", trade.core.qty, "market"); }
+    catch (e) { console.log("core market-sell err:", e.message); }
+    trade.core.filled = true;
+    if (trade.mid && !trade.mid.closed) {
+      try { await cancelOrder(trade.mid.sellId); } catch {}
+      try { await placeOrder(trade.symbol, "sell_to_close", trade.mid.qty, "market"); }
+      catch (e) { console.log("mid market-sell err:", e.message); }
+      trade.mid.closed = true;
+    }
+    if (trade.runner && !trade.runner.closed && trade.runner.qty > 0) {
+      try { await placeOrder(trade.symbol, "sell_to_close", trade.runner.qty, "market"); }
+      catch (e) { console.log("runner market-sell err:", e.message); }
+      trade.runner.closed = true;
+    }
+    console.log("⏰ Extended time-stop flush complete — flat.");
   }, TIME_STOP_MIN * 60000);
   console.log(`⏱️ Timer reset to ${TIME_STOP_MIN} min`);
   res.json({ ok: true, resetTo: TIME_STOP_MIN });
 });
 // ─── EMERGENCY ──────────────────────────────────
+// Hard exit: cancels any resting orders and market-sells whatever's still open.
 app.all("/emergency", async (req, res) => {
   if (!activeTrade) return res.status(400).json({ error: "No active trade" });
   try {
-    console.log("🚨 EMERGENCY — selling all at market");
+    console.log("🚨 EMERGENCY — closing everything at market");
     const trade = activeTrade;
     activeTrade = null;
     clearTimeout(trade.timeout);
-    if (sellWatcherInterval) { clearInterval(sellWatcherInterval); sellWatcherInterval = null; }
-    await cancelOrder(trade.sellId);
-    await placeOrder(trade.symbol, "sell_to_close", trade.qty, "market");
-    res.json({ ok: true, sold: "market", qty: trade.qty });
+    if (trade.eodTimeout) clearTimeout(trade.eodTimeout);
+    stopWatcher();
+    let totalSold = 0;
+    if (trade.core && !trade.core.filled) {
+      await cancelOrder(trade.core.sellId);
+      await placeOrder(trade.symbol, "sell_to_close", trade.core.qty, "market");
+      totalSold += trade.core.qty;
+    }
+    if (trade.mid && !trade.mid.closed) {
+      await cancelOrder(trade.mid.sellId);
+      await placeOrder(trade.symbol, "sell_to_close", trade.mid.qty, "market");
+      totalSold += trade.mid.qty;
+    }
+    if (trade.runner && !trade.runner.closed && trade.runner.qty > 0) {
+      await placeOrder(trade.symbol, "sell_to_close", trade.runner.qty, "market");
+      totalSold += trade.runner.qty;
+    }
+    res.json({ ok: true, sold: "market", qty: totalSold });
   } catch (err) {
     console.error("❌ Emergency error:", err.message);
     res.status(500).json({ error: err.message });
